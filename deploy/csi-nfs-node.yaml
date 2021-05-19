@@ -17,6 +17,7 @@ spec:
     spec:
       hostNetwork: true  # original nfs connection would be broken without hostNetwork setting
       dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: csi-nfs-controller-sa
       nodeSelector:
         kubernetes.io/os: linux
       containers:
@@ -63,7 +64,7 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: mcr.microsoft.com/k8s/csi/nfs-csi:latest
+          image: whynotea/nfs-csi:latest
           args:
             - "-v=5"
             - "--nodeid=$(NODE_ID)"
@@ -94,6 +95,21 @@ spec:
             - name: pods-mount-dir
               mountPath: /var/lib/kubelet/pods
               mountPropagation: "Bidirectional"
+        - name: csi-snapshotter
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          image: k8s.gcr.io/sig-storage/csi-snapshotter:v4.0.0
+          args:
+            - "--v=5"
+            - "--csi-address=/csi/csi.sock"
+            - "--leader-election=false"
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
       volumes:
         - name: socket-dir
           hostPath:

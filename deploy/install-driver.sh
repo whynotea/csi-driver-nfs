@@ -38,4 +38,7 @@ kubectl apply -f $repo/rbac-csi-nfs-controller.yaml
 kubectl apply -f $repo/csi-nfs-driverinfo.yaml
 kubectl apply -f $repo/csi-nfs-controller.yaml
 kubectl apply -f $repo/csi-nfs-node.yaml
+kubectl apply -f $repo/snapshotter/rbac-csi-nfs-snapshotter-controller.yaml
+kubectl apply -f $repo/snapshotter/csi-nfs-snapshotter-controller.yaml
 echo 'NFS CSI driver installed successfully.'
+

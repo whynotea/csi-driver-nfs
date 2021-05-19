@@ -82,6 +82,8 @@ func NewNFSdriver(nodeID, endpoint string, perm *uint32) *Driver {
 	// ControllerServiceCapability RPC types.
 	n.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 	})
 
 	n.AddNodeServiceCapabilities([]csi.NodeServiceCapability_RPC_Type{

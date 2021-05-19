@@ -1,0 +1,47 @@
+# This YAML file shows how to deploy the snapshot controller
+
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: csi-nfs-snapshotter-controller
+  namespace: {{ .Release.Namespace }}
+{{ include "nfs.labels" . | indent 2 }}
+spec:
+  replicas: {{ .Values.snapshotterController.replicas }}
+  selector:
+    matchLabels:
+      app: csi-nfs-snapshotter-controller
+  # the snapshot controller won't be marked as ready if the v1 CRDs are unavailable
+  # in #504 the snapshot-controller will exit after around 7.5 seconds if it
+  # can't find the v1 CRDs so this value should be greater than that
+  minReadySeconds: 15
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+{{ include "nfs.labels" . | indent 6 }}
+        app: csi-nfs-snapshotter-controller
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml .Values.imagePullSecrets | indent 8 }}
+      {{- end }}
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccount: csi-nfs-snapshotter-controller-sa
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- if .Values.controller.runOnMaster}}
+        kubernetes.io/role: master
+        {{- end}}
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: csi-nfs-snapshotter-controller
+          image: "{{ .Values.image.snapshotterController.repository }}:{{ .Values.image.snapshotterController.tag }}"
+          args:
+            - "--v=5"
+            - "--leader-election=true"
+          imagePullPolicy: {{ .Values.image.snapshotterController.pullPolicy }}

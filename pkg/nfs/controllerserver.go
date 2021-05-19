@@ -24,11 +24,13 @@ import (
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"k8s.io/klog/v2"
+	utilexec "k8s.io/utils/exec"
 )
 
 // ControllerServer controller server setting
@@ -68,6 +70,12 @@ const (
 	totalIDElements // Always last
 )
 
+var createVolumeStatus map[string]string
+
+func init() {
+	createVolumeStatus = make(map[string]string)
+}
+
 // CreateVolume create a volume
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	name := req.GetName()
@@ -101,12 +109,49 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	// Create subdirectory under base-dir
 	// TODO: revisit permissions
 	internalVolumePath := cs.getInternalVolumePath(nfsVol)
+
+	if _, ok := createVolumeStatus[name]; !ok {
+		createVolumeStatus[name] = "Started"
+	}
 	if err = os.Mkdir(internalVolumePath, 0777); err != nil && !os.IsExist(err) {
 		return nil, status.Errorf(codes.Internal, "failed to make subdirectory: %v", err.Error())
 	}
+
+	if req.GetVolumeContentSource() != nil {
+		path := internalVolumePath
+		volumeSource := req.VolumeContentSource
+		switch volumeSource.Type.(type) {
+		case *csi.VolumeContentSource_Snapshot:
+			if snapshot := volumeSource.GetSnapshot(); snapshot != nil {
+				nfsSnapshot, _ := cs.getNfsVolFromID(snapshot.GetSnapshotId())
+				if createVolumeStatus[name] == "Started" {
+					createVolumeStatus[name] = "Loading"
+					err = cs.loadFromSnapshot(ctx, nfsSnapshot, path, volCap, name)
+				} else if createVolumeStatus[name] == "Loading" {
+					return nil, status.Error(codes.Internal, "Already loading from snapshot")
+				} else {
+					delete(createVolumeStatus, name)
+				}
+			}
+		case *csi.VolumeContentSource_Volume:
+			if srcVolume := volumeSource.GetVolume(); srcVolume != nil {
+				srcVol, _ := cs.getNfsVolFromID(srcVolume.GetVolumeId())
+				srcPath := cs.getInternalVolumePath(srcVol)
+				srcPath = filepath.Join(cs.getInternalMountPath(nfsVol), filepath.Base(srcPath))
+				err = cs.loadFromFilesystemVolume(srcPath, path)
+			}
+		default:
+			err = status.Errorf(codes.InvalidArgument, "%v not a proper volume source", volumeSource)
+		}
+		if err != nil {
+			klog.V(4).Infof("VolumeSource error: %v", err)
+		}
+		klog.V(4).Infof("successfully populated volume %s", nfsVol.id)
+	}
+
 	// Remove capacity setting when provisioner 1.4.0 is available with fix for
 	// https://github.com/kubernetes-csi/external-provisioner/pull/271
-	return &csi.CreateVolumeResponse{Volume: cs.nfsVolToCSI(nfsVol, reqCapacity)}, nil
+	return &csi.CreateVolumeResponse{Volume: cs.nfsVolToCSI(nfsVol, reqCapacity, req.GetVolumeContentSource())}, nil
 }
 
 // DeleteVolume delete a volume
@@ -183,12 +228,111 @@ func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *
 	}, nil
 }
 
+// CreateSnapshot uses tar command to create snapshot for hostpath volume. The tar command can quickly create
+// archives of entire directories. The host image must have "tar" binaries in /bin, /usr/sbin, or /usr/bin.
 func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	name := req.GetName()
+	if len(name) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Name missing in request")
+	}
+	// Check arguments
+	if len(req.GetSourceVolumeId()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "SourceVolumeId missing in request")
+	}
+
+	volumeID := req.GetSourceVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is empty")
+	}
+	nfsVol, err := cs.getNfsVolFromID(volumeID)
+	if err != nil {
+		// An invalid ID should be treated as doesn't exist
+		klog.Warningf("failed to get nfs volume for volume id %v, error: %v", volumeID, err)
+		return nil, err
+	}
+
+	nfsSnapshot, err := cs.newNFSVolume(name, nfsVol.size, req.GetParameters())
+
+	// Mount nfs volume base share so we can create snapshot of the subdirectory
+	if err = cs.internalMount(ctx, nfsVol, nil); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to mount volume nfs server: %v", err.Error())
+	}
+	defer func() {
+		if err = cs.internalUnmount(ctx, nfsVol); err != nil {
+			klog.Warningf("failed to unmount volume nfs server: %v", err.Error())
+		}
+	}()
+
+	// Mount nfs snapshot base share so we can create a snapshot
+	if err = cs.internalMount(ctx, nfsSnapshot, nil); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to mount snapshot nfs server: %v", err.Error())
+	}
+	defer func() {
+		if err = cs.internalUnmount(ctx, nfsSnapshot); err != nil {
+			klog.Warningf("failed to unmount snapshot nfs server: %v", err.Error())
+		}
+	}()
+
+	// snapshot subdirectory under base-dir
+	volPath := cs.getInternalVolumePath(nfsVol)
+	snapPath := cs.getInternalVolumePath(nfsSnapshot)
+
+	if _, err := os.Stat(volPath); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "Source volume doesn't exist: %v", err.Error())
+	}
+
+	creationTime := ptypes.TimestampNow()
+
+	var cmd []string
+	klog.V(4).Infof("Creating snapshot of Filsystem Volume %v as %v", volPath, snapPath)
+	cmd = []string{"tar", "czf", snapPath, "-C", volPath, "."}
+	executor := utilexec.New()
+	out, err := executor.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed create snapshot: %w: %s", err, out)
+	}
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SnapshotId:     nfsSnapshot.id,
+			SourceVolumeId: volumeID,
+			CreationTime:   creationTime,
+			SizeBytes:      nfsSnapshot.size,
+			ReadyToUse:     true,
+		},
+	}, nil
 }
 
 func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "")
+	snapshotID := req.GetSnapshotId()
+	if snapshotID == "" {
+		return nil, status.Error(codes.InvalidArgument, "snapshot id is empty")
+	}
+	nfsSnapshot, err := cs.getNfsVolFromID(snapshotID)
+	if err != nil {
+		// An invalid ID should be treated as doesn't exist
+		klog.Warningf("failed to get nfs snapshot for snapshot id %v deletion: %v", snapshotID, err)
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	// Mount nfs base share so we can delete the snapshot
+	if err = cs.internalMount(ctx, nfsSnapshot, nil); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to mount snapshot nfs server: %v", err.Error())
+	}
+	defer func() {
+		if err = cs.internalUnmount(ctx, nfsSnapshot); err != nil {
+			klog.Warningf("failed to unmount snapshot nfs server: %v", err.Error())
+		}
+	}()
+
+	// Delete subdirectory under base-dir
+	internalSnapshotPath := cs.getInternalVolumePath(nfsSnapshot)
+
+	klog.V(2).Infof("Removing snapshot at %v", internalSnapshotPath)
+	if err = os.RemoveAll(internalSnapshotPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete snapshot: %v", err.Error())
+	}
+	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (cs *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
@@ -338,10 +482,11 @@ func (cs *ControllerServer) getVolumeSharePath(vol *nfsVolume) string {
 }
 
 // Convert into nfsVolume into a csi.Volume
-func (cs *ControllerServer) nfsVolToCSI(vol *nfsVolume, reqCapacity int64) *csi.Volume {
+func (cs *ControllerServer) nfsVolToCSI(vol *nfsVolume, reqCapacity int64, contentsource *csi.VolumeContentSource) *csi.Volume {
 	return &csi.Volume{
 		CapacityBytes: reqCapacity,
 		VolumeId:      vol.id,
+		ContentSource: contentsource,
 		VolumeContext: map[string]string{
 			paramServer: vol.server,
 			paramShare:  cs.getVolumeSharePath(vol),
@@ -372,4 +517,43 @@ func (cs *ControllerServer) getNfsVolFromID(id string) (*nfsVolume, error) {
 		baseDir: tokens[2],
 		subDir:  tokens[3],
 	}, nil
+}
+
+func (cs *ControllerServer) loadFromSnapshot(ctx context.Context, nfsSnapshot *nfsVolume, destPath string, volCap *csi.VolumeCapability, srcName string) error {
+
+	// Mount nfs snapshot base share so we can create a snapshot
+	if err := cs.internalMount(ctx, nfsSnapshot, volCap); err != nil {
+		return status.Errorf(codes.Internal, "failed to mount snapshot nfs server: %v", err.Error())
+	}
+	defer func() {
+		if err := cs.internalUnmount(ctx, nfsSnapshot); err != nil {
+			klog.Warningf("failed to unmount snapshot nfs server: %v", err.Error())
+		}
+	}()
+
+	snapPath := cs.getInternalVolumePath(nfsSnapshot)
+	var cmd []string
+	cmd = []string{"tar", "zxvf", snapPath, "-C", destPath}
+
+	executor := utilexec.New()
+	klog.V(4).Infof("Command Start: %v", cmd)
+	out, err := executor.Command(cmd[0], cmd[1:]...).CombinedOutput()
+	klog.V(4).Infof("Command Finish: %v", string(out))
+	if err != nil {
+		return fmt.Errorf("failed to pre-populate data from snapshot %v: %w: %s", snapPath, err, out)
+	} else {
+		createVolumeStatus[srcName] = "Loaded"
+	}
+	return nil
+}
+
+func (cs *ControllerServer) loadFromFilesystemVolume(srcPath, destPath string) error {
+	// If the source path volume is empty it's a noop and we just move along, otherwise the cp call will fail with a a file stat error DNE
+	args := []string{"-a", srcPath + "/.", destPath + "/"}
+	executor := utilexec.New()
+	out, err := executor.Command("cp", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed pre-populate data from volume %v: %s: %w", srcPath, out, err)
+	}
+	return nil
 }
